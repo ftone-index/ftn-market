@@ -1,23 +1,116 @@
 import requests
+from bs4 import BeautifulSoup
 import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 import datetime
+import re
 import logging
 
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 
-# ---------- MARKET EXPECTATION ENDPOINT ----------
+# ---------- HELPERS ----------
+def fetch_soup(url, timeout=10):
+    r = requests.get(url, timeout=timeout)
+    return BeautifulSoup(r.text, 'html.parser')
+
+def extract_text(soup, max_chars=4000):
+    for selector in ['article', 'div#content', 'body']:
+        if selector == 'div#content':
+            tag = soup.find('div', id='content')
+        else:
+            tag = soup.select_one(selector)
+        if tag:
+            return tag.get_text()[:max_chars]
+    return ""
+
+def looks_like_individual_doc(url):
+    if any(kw in url for kw in ['foia', 'rss', '.xml', 'speeches.htm', 'pressreleases.htm', 'fomcminutes.htm']):
+        return False
+    if re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', url, re.IGNORECASE):
+        return True
+    if re.search(r'\d{8}', url):
+        return True
+    if re.search(r'\d{4,}[a-z]\.htm', url, re.IGNORECASE):
+        return True
+    return False
+
+def extract_speaker_from_url(url):
+    m = re.search(r'/([a-z]+?)\d{8,}a?\.htm', url, re.IGNORECASE)
+    if m:
+        name = m.group(1).capitalize()
+        known = {
+            'Powell': 'Powell', 'Bowman': 'Bowman', 'Jefferson': 'Jefferson',
+            'Waller': 'Waller', 'Warsh': 'Warsh', 'Brainard': 'Brainard',
+            'Clarida': 'Clarida', 'Quarles': 'Quarles', 'Logan': 'Logan',
+            'Mester': 'Mester', 'Williams': 'Williams', 'Bostic': 'Bostic',
+            'Harker': 'Harker', 'Kashkari': 'Kashkari', 'George': 'George',
+            'Bullard': 'Bullard', 'Evans': 'Evans', 'Rosengren': 'Rosengren',
+            'Kaplan': 'Kaplan', 'Daly': 'Daly', 'Barkin': 'Barkin',
+        }
+        return known.get(name, name)
+    return 'Fed'
+
+# ---------- SOURCE SCRAPERS (SECONDARY ONLY) ----------
+def scrape_regional_fed_speeches():
+    try:
+        soup = fetch_soup("https://www.newyorkfed.org/newsevents/speeches")
+        items = soup.select('a[href*="speech"]')
+        sources = []
+        for a in items[:2]:
+            href = a.get('href')
+            if href:
+                full_url = "https://www.newyorkfed.org" + href if href.startswith('/') else href
+                title = a.get_text(strip=True) or "Regional Fed Speech"
+                if not any(s['url'] == full_url for s in sources):
+                    sources.append({'type': 'regional_speech', 'title': title, 'url': full_url})
+        logging.info(f"Scraped {len(sources)} regional Fed speech links")
+        return sources
+    except Exception as e:
+        logging.error(f"Regional Fed speeches scrape error: {e}")
+        return []
+
+def scrape_fed_testimony():
+    try:
+        soup = fetch_soup("https://www.federalreserve.gov/newsevents/testimony.htm")
+        items = soup.select('a[href*="testimony"]')
+        sources = []
+        for a in items[:2]:
+            href = a.get('href')
+            if href:
+                full_url = "https://www.federalreserve.gov" + href if href.startswith('/') else href
+                if looks_like_individual_doc(full_url):
+                    title = a.get_text(strip=True) or "Testimony"
+                    if not any(s['url'] == full_url for s in sources):
+                        sources.append({'type': 'testimony', 'title': title, 'url': full_url})
+        logging.info(f"Scraped {len(sources)} testimony links")
+        return sources
+    except Exception as e:
+        logging.error(f"Testimony scrape error: {e}")
+        return []
+
+def scrape_fed_blogs():
+    try:
+        soup = fetch_soup("https://libertystreeteconomics.newyorkfed.org/")
+        items = soup.select('a[href*="libertystreeteconomics"]')
+        sources = []
+        for a in items[:2]:
+            href = a.get('href')
+            if href:
+                full_url = href if href.startswith('http') else "https://libertystreeteconomics.newyorkfed.org" + href
+                title = a.get_text(strip=True) or "Fed Blog Post"
+                if not any(s['url'] == full_url for s in sources):
+                    sources.append({'type': 'fed_blog', 'title': title, 'url': full_url})
+        logging.info(f"Scraped {len(sources)} Fed blog links")
+        return sources
+    except Exception as e:
+        logging.error(f"Fed blogs scrape error: {e}")
+        return []
+
+# ---------- MARKET EXPECTATION ----------
 def compute_market_ftn():
-    """
-    Returns a 0‑100 score representing what the market is pricing in
-    about the Fed's next moves, derived from:
-      - 2‑year Treasury yield (rate hike/cut expectations)
-      - 2y/10y Treasury spread (yield curve)
-      - US Dollar Index (DXY) intraday change
-    """
     y2 = None
     y10 = None
     spread = 0
@@ -108,6 +201,7 @@ def compute_market_ftn():
         "dxy_change": dxy_change
     }
 
+# ---------- ROUTES ----------
 @app.route('/api/market_ftn')
 def market_ftn():
     score, label, components = compute_market_ftn()
@@ -122,13 +216,35 @@ def market_ftn():
         "timestamp": ts
     })
 
+@app.route('/api/extra_scores')
+def extra_scores():
+    """Return sources and raw scores for secondary documents, so FTN-Index can incorporate them."""
+    all_sources = []
+    all_sources.extend(scrape_regional_fed_speeches())
+    all_sources.extend(scrape_fed_testimony())
+    all_sources.extend(scrape_fed_blogs())
+    scores = []
+    for src in all_sources:
+        try:
+            soup = fetch_soup(src['url'])
+            text = extract_text(soup)
+            if text:
+                # We'll let FTN-Index do the AI scoring, just return the sources
+                pass
+        except Exception as e:
+            logging.error(f"Error processing extra source {src['url']}: {e}")
+    return jsonify({
+        "sources": all_sources,
+        "scores": []   # FTN-Index will score these itself
+    })
+
 @app.route('/health')
 def health():
     return "OK"
 
 @app.route('/')
 def home():
-    return "FTN Market Service is live. Use /api/market_ftn"
+    return "FTN Market Service is live. Use /api/market_ftn or /api/extra_scores"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
